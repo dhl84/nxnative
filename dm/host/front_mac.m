@@ -149,16 +149,14 @@ static void push(void) {
     int32_t rx = (g_rr - g_rl) * 32767, ry = (g_ru - g_rd) * 32767;
     dm_input_set(g_btn, lx, ly, rx, ry);
 }
-static int key_bit(unsigned short code) {
-    switch (code) {
-        case 38: return 0;  case 40: return 1;  case 32: return 2;  case 34: return 3;    // J K U I → A B X Y
-        case 3: return 4;   case 5: return 5;                                            // F G → press stick
-        case 12: return 6;  case 14: return 7;  case 6: return 8;   case 8: return 9;    // Q E Z C → L R ZL ZR
-        case 36: return 10; case 48: return 11;                                          // Return Tab → + −
-        case 123: return 12; case 126: return 13; case 124: return 14; case 125: return 15; // ← ↑ → ↓
-    }
-    return -1;
-}
+// The controls a player can remap (Window > Controls…, DmControls below; kept in the user defaults DMKeyMap / DMKeyNames / DMPadMap). Actions 0-15 are the pad's buttons by
+// their bit (A B X Y, the stick presses, L R ZL ZR, + −, D-pad left up right down), then the left and right stick's up, down, left and right, then Shake.
+// g_keymap: the key code of each action (-1 none). g_padsrc: the controller button, as GameController or raw HID reads it, that presses each of the 16 buttons (pad_set)
+enum { CT_BTN = 16, CT_SHAKE = 24, CT_N = 25 };
+static const int ct_keymap0[CT_N] = {38, 40, 32, 34, 3, 5, 12, 14, 6, 8, 36, 48, 123, 126, 124, 125, 13, 1, 0, 2, -1, -1, -1, -1, 49};   // J K U I, F G, Q E Z C, Return Tab, the arrows, W S A D, Space
+static int g_keymap[CT_N] = {38, 40, 32, 34, 3, 5, 12, 14, 6, 8, 36, 48, 123, 126, 124, 125, 13, 1, 0, 2, -1, -1, -1, -1, 49};
+static int g_padsrc[CT_BTN] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+static int g_pad_remapped;   // g_padsrc is not the identity
 // fn held with a letter: the arrow and function keys carry the same modifier flag, so the key must be a letter for this to be a Globe shortcut
 static int fn_shortcut(NSEvent *e) {
     NSString *s = e.charactersIgnoringModifiers;
@@ -173,15 +171,18 @@ static void on_key(NSEvent *e, int down) {
         if (down && g_cp.phase == CP_OPEN) { if (c == 53 || c == 40) g_cp_cancel = 1; else if (c == 36 || c == 38) g_cp_confirm = 1; cp_poll(); }
         return;
     }
-    switch (c) { case 13: g_w = down; break; case 0: g_a = down; break; case 1: g_s = down; break; case 2: g_d = down; break; }
     // An arrow key pressed with Shift held is the right stick until it is released; without Shift, the D-pad. The keyboard had no right stick: a 3D game's camera
     // could be turned only with a controller (Donkey Kong Bananza)
     int *rs = c == 123 ? &g_rl : c == 126 ? &g_ru : c == 124 ? &g_rr : c == 125 ? &g_rd : NULL;
     if (rs && (down ? (e.modifierFlags & NSEventModifierFlagShift) != 0 : *rs)) { *rs = down; push(); return; }
-    int b = key_bit(c);
-    uint64_t m = b >= 0 ? 1ull << b : c == 49 ? DM_BTN_SHAKE : 0;   // Space: shaken while held
-    g_btn = down ? (g_btn | m) : (g_btn & ~m);
-    if (down && (m || c == 13 || c == 0 || c == 1 || c == 2)) cursor_hide_for_input();   // a key the game takes (WASD: the left stick)
+    int *const axis[8] = {&g_w, &g_s, &g_a, &g_d, &g_ru, &g_rd, &g_rl, &g_rr}; int hit = 0;
+    for (int i = 0; i < CT_N; i++) if (g_keymap[i] == c) {   // every action the key is bound to
+        hit = 1;
+        if (i >= CT_BTN && i < CT_SHAKE) { *axis[i - CT_BTN] = down; continue; }
+        uint64_t m = i == CT_SHAKE ? DM_BTN_SHAKE : 1ull << i;   // Shake: shaken while held
+        g_btn = down ? (g_btn | m) : (g_btn & ~m);
+    }
+    if (down && hit) cursor_hide_for_input();   // a key the game takes
     push();
 }
 
@@ -197,6 +198,7 @@ static int32_t pad_axis(float v) { return (int32_t)(fmaxf(-1.f, fminf(1.f, v)) *
 // A controller's state for player p, GameController or raw HID: a pressed button or a stick past 15% hides the pointer (cursor_hide_for_input), a resting stick's drift does not
 static void pad_set(int p, uint64_t m, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     const int32_t dead = DM_STICK_MAX * 15 / 100;
+    if (g_pad_remapped) { uint64_t o = m & ~0xffffull; for (int t = 0; t < CT_BTN; t++) if (m >> g_padsrc[t] & 1) o |= 1ull << t; m = o; }   // the player's controller buttons (Controls…)
     if (m || abs(lx) > dead || abs(ly) > dead || abs(rx) > dead || abs(ry) > dead) cursor_hide_for_input();
     dm_pad_set_player(p, m, lx, ly, rx, ry);
 }
@@ -718,8 +720,109 @@ void front_picture_shape(int w, int h) { if (w > 0 && h > 0) g_picture_aspect = 
 
 // AppKit reports a refused fullscreen request only to the window delegate (there is no notification for it)
 static void (^g_fs_failed)(void);
+// The frame-rate counter: a small label at the window's top left, off by default. Window > Frame-rate Counter (⌘⇧F) switches it while the game runs and the choice is kept
+// (the user default DMShowFPS); DM_SHOW_FPS=1 / 0 sets it for one start. The number is the presents of the last second (front_ios.m front_ios_fps_label)
+uint64_t mtl_present_count(void);
+static NSTextField *g_fps_label;
+static void fps_label_show(BOOL on) {
+    if (on && !g_fps_label) {
+        NSView *cv = g_win.contentView; NSTextField *l = [NSTextField labelWithString:@"--"];
+        l.font = [NSFont monospacedDigitSystemFontOfSize:10 weight:NSFontWeightMedium]; l.textColor = [NSColor colorWithWhite:1 alpha:0.75]; l.alignment = NSTextAlignmentCenter;
+        l.drawsBackground = YES; l.backgroundColor = [NSColor colorWithWhite:0 alpha:0.35];
+        l.frame = NSMakeRect(6, cv.bounds.size.height - 20, 28, 14); l.autoresizingMask = NSViewMaxXMargin | NSViewMinYMargin;   // stays at the top left when the window's size changes
+        [cv addSubview:l]; g_fps_label = l;
+        __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime();
+        [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+            (void)t; uint64_t n = mtl_present_count(); double now = CACurrentMediaTime();
+            if (now - t0 < 1.5) l.stringValue = [NSString stringWithFormat:@"%.0f", (n - n0) / (now - t0)];   // a longer span is time with the timer held: no reading
+            n0 = n; t0 = now;
+        }];
+    }
+    g_fps_label.hidden = !on;
+}
+// Controls (Window > Controls…, ⌘,): a panel with a row for each action of g_keymap. Click a row's key, then press the new key (Escape keeps the old one, Delete leaves the
+// action without a key; a key taken from another action leaves that one without). The pop-up beside a button picks the controller button that presses it. Both are kept in the
+// user defaults and apply at once. Sticks of a controller are not remapped, and Switch 2 pads and Joy-Cons read from HID keep their own buttons
+static NSString *g_keyname[CT_N];
+static NSArray<NSString *> *ct_names(void) { return @[@"A", @"B", @"X", @"Y", @"Left stick press", @"Right stick press", @"L", @"R", @"ZL", @"ZR", @"+", @"−", @"D-pad left", @"D-pad up", @"D-pad right", @"D-pad down",
+                                                      @"Left stick up", @"Left stick down", @"Left stick left", @"Left stick right", @"Right stick up", @"Right stick down", @"Right stick left", @"Right stick right", @"Shake"]; }
+static NSArray<NSString *> *ct_keynames0(void) { return @[@"J", @"K", @"U", @"I", @"F", @"G", @"Q", @"E", @"Z", @"C", @"Return", @"Tab", @"←", @"↑", @"→", @"↓", @"W", @"S", @"A", @"D", @"", @"", @"", @"", @"Space"]; }
+static NSString *ct_key_name(NSEvent *e) {
+    switch (e.keyCode) { case 36: return @"Return"; case 48: return @"Tab"; case 49: return @"Space"; case 123: return @"←"; case 124: return @"→"; case 125: return @"↓"; case 126: return @"↑"; }
+    NSString *s = e.charactersIgnoringModifiers.uppercaseString;
+    return s.length && [s characterAtIndex:0] > 32 && [s characterAtIndex:0] < 0xF700 ? s : [NSString stringWithFormat:@"Key %d", e.keyCode];
+}
+static void ct_pad_flag(void) { g_pad_remapped = 0; for (int i = 0; i < CT_BTN; i++) if (g_padsrc[i] != i) g_pad_remapped = 1; }
+static void ct_save(void) {
+    NSMutableArray *k = [NSMutableArray array], *n = [NSMutableArray array], *p = [NSMutableArray array];
+    for (int i = 0; i < CT_N; i++) { [k addObject:@(g_keymap[i])]; [n addObject:g_keyname[i] ?: @""]; }
+    for (int i = 0; i < CT_BTN; i++) [p addObject:@(g_padsrc[i])];
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults; [d setObject:k forKey:@"DMKeyMap"]; [d setObject:n forKey:@"DMKeyNames"]; [d setObject:p forKey:@"DMPadMap"];
+    ct_pad_flag();
+}
+static void ct_reset(void) { NSArray *n = ct_keynames0(); for (int i = 0; i < CT_N; i++) { g_keymap[i] = ct_keymap0[i]; g_keyname[i] = n[i]; } for (int i = 0; i < CT_BTN; i++) g_padsrc[i] = i; }
+static void ct_load(void) {   // a saved list of another length (an older or newer build's) is left out: the defaults
+    ct_reset();
+    NSUserDefaults *d = NSUserDefaults.standardUserDefaults; NSArray *k = [d arrayForKey:@"DMKeyMap"], *n = [d arrayForKey:@"DMKeyNames"], *p = [d arrayForKey:@"DMPadMap"];
+    if (k.count == CT_N && n.count == CT_N) for (int i = 0; i < CT_N; i++) { int c = [k[i] intValue]; g_keymap[i] = c >= 0 && c < 256 ? c : -1; g_keyname[i] = [n[i] isKindOfClass:NSString.class] ? n[i] : @""; }
+    if (p.count == CT_BTN) for (int i = 0; i < CT_BTN; i++) { int b = [p[i] intValue]; g_padsrc[i] = b >= 0 && b < CT_BTN ? b : i; }
+    ct_pad_flag();
+    if (g_pad_remapped || memcmp(g_keymap, ct_keymap0, sizeof g_keymap)) LOG("front end: the player's own controls are in use (Window > Controls…)");
+}
+@interface DmControls : NSObject <NSWindowDelegate> @end
+@implementation DmControls { NSPanel *_panel; NSButton *_keys[CT_N]; NSPopUpButton *_pads[CT_BTN]; int _bind; id _mon; }
+- (void)show:(id)sender {
+    (void)sender;
+    if (!_panel) {
+        _bind = -1;
+        NSGridView *g = [NSGridView gridViewWithNumberOfColumns:3 rows:0]; g.rowSpacing = 3; g.columnSpacing = 12; g.translatesAutoresizingMaskIntoConstraints = NO;
+        NSTextField *h0 = [NSTextField labelWithString:@"Game"], *h1 = [NSTextField labelWithString:@"Key"], *h2 = [NSTextField labelWithString:@"Controller button"];
+        for (NSTextField *h in @[h0, h1, h2]) { h.font = [NSFont boldSystemFontOfSize:NSFont.smallSystemFontSize]; h.textColor = NSColor.secondaryLabelColor; }
+        [g addRowWithViews:@[h0, h1, h2]];
+        NSArray<NSString *> *names = ct_names();
+        for (int i = 0; i < CT_N; i++) {
+            NSTextField *l = [NSTextField labelWithString:names[i]]; l.font = [NSFont systemFontOfSize:NSFont.smallSystemFontSize];
+            NSButton *b = [NSButton buttonWithTitle:@"" target:self action:@selector(bind:)]; b.tag = i; b.controlSize = NSControlSizeSmall; b.font = l.font; [b.widthAnchor constraintEqualToConstant:110].active = YES; _keys[i] = b;
+            NSView *third = NSGridCell.emptyContentView;
+            if (i < CT_BTN) { NSPopUpButton *p = [NSPopUpButton new]; p.controlSize = NSControlSizeSmall; p.font = l.font; [p addItemsWithTitles:[names subarrayWithRange:NSMakeRange(0, CT_BTN)]]; p.tag = i; p.target = self; p.action = @selector(pad:); _pads[i] = p; third = p; }
+            [g addRowWithViews:@[l, b, third]];
+        }
+        NSButton *reset = [NSButton buttonWithTitle:@"Reset to defaults" target:self action:@selector(reset:)]; reset.controlSize = NSControlSizeSmall; reset.translatesAutoresizingMaskIntoConstraints = NO;
+        NSView *cv = [NSView new]; [cv addSubview:g]; [cv addSubview:reset];
+        [NSLayoutConstraint activateConstraints:@[[g.topAnchor constraintEqualToAnchor:cv.topAnchor constant:14], [g.leadingAnchor constraintEqualToAnchor:cv.leadingAnchor constant:16], [g.trailingAnchor constraintEqualToAnchor:cv.trailingAnchor constant:-16],
+            [reset.topAnchor constraintEqualToAnchor:g.bottomAnchor constant:12], [reset.leadingAnchor constraintEqualToAnchor:g.leadingAnchor], [reset.bottomAnchor constraintEqualToAnchor:cv.bottomAnchor constant:-14]]];
+        _panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 420, 600) styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable backing:NSBackingStoreBuffered defer:NO];
+        _panel.title = @"Controls"; _panel.releasedWhenClosed = NO; _panel.delegate = self; _panel.contentView = cv; [_panel setContentSize:cv.fittingSize]; [_panel center];
+    }
+    [self refresh]; [_panel makeKeyAndOrderFront:nil];
+}
+- (void)refresh {
+    for (int i = 0; i < CT_N; i++) _keys[i].title = i == _bind ? @"Press a key…" : g_keymap[i] < 0 || !g_keyname[i].length ? @"—" : g_keyname[i];
+    for (int i = 0; i < CT_BTN; i++) [_pads[i] selectItemAtIndex:g_padsrc[i]];
+}
+- (void)endBind { _bind = -1; if (_mon) { [NSEvent removeMonitor:_mon]; _mon = nil; } [self refresh]; }
+- (void)bind:(NSButton *)b {
+    [self endBind]; _bind = (int)b.tag; [self refresh];
+    __weak DmControls *me = self;
+    _mon = [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown handler:^NSEvent *(NSEvent *e) {
+        DmControls *s = me; if (!s || s->_bind < 0 || e.window != s->_panel) return e;
+        if (e.modifierFlags & NSEventModifierFlagCommand) return e;   // ⌘ shortcuts stay the menu's
+        int a = s->_bind, c = e.keyCode;
+        if (c == 51) { g_keymap[a] = -1; g_keyname[a] = @""; }   // Delete: no key
+        else if (c != 53) {   // Escape keeps the old key
+            for (int i = 0; i < CT_N; i++) if (g_keymap[i] == c) { g_keymap[i] = -1; g_keyname[i] = @""; }
+            g_keymap[a] = c; g_keyname[a] = ct_key_name(e);
+        }
+        ct_save(); [s endBind]; return nil;
+    }];
+}
+- (void)pad:(NSPopUpButton *)p { g_padsrc[p.tag] = (int)p.indexOfSelectedItem; ct_save(); }
+- (void)reset:(id)sender { (void)sender; [self endBind]; ct_reset(); ct_save(); [self refresh]; }
+- (void)windowWillClose:(NSNotification *)n { (void)n; [self endBind]; }
+@end
 @interface DmWinDelegate : NSObject <NSWindowDelegate> @end
 @implementation DmWinDelegate
+- (void)toggleFPS:(NSMenuItem *)it { BOOL on = !g_fps_label || g_fps_label.hidden; fps_label_show(on); it.state = on ? NSControlStateValueOn : NSControlStateValueOff; [NSUserDefaults.standardUserDefaults setBool:on forKey:@"DMShowFPS"]; }
 - (void)windowDidFailToEnterFullScreen:(NSWindow *)w { (void)w; if (g_fs_failed) g_fs_failed(); }
 // Fullscreen hides the menu bar and the Dock for good. AppKit's default auto-hide still brought the menu bar over the picture on macOS 27 with two screens,
 // whenever the game was the active app. ⌃⌘F and ⌘Q still work without the bar shown. HideMenuBar requires HideDock (NSApplication presentationOptions rules)
@@ -1651,6 +1754,12 @@ void front_run(void (*guest)(void)) {
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
         NSApp.mainMenu = bar;
         static DmWinDelegate *wd; wd = [DmWinDelegate new]; win.delegate = wd;   // also for fullscreen entered later (⌃⌘F, the green button): no menu bar over the game
+        { const char *e = getenv("DM_SHOW_FPS"); BOOL on = e ? atoi(e) != 0 : [NSUserDefaults.standardUserDefaults boolForKey:@"DMShowFPS"];
+          NSMenuItem *fi = [wm addItemWithTitle:@"Frame-rate Counter" action:@selector(toggleFPS:) keyEquivalent:@"f"]; fi.target = wd;
+          fi.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift; fi.state = on ? NSControlStateValueOn : NSControlStateValueOff;
+          if (on) fps_label_show(YES); }
+        { ct_load(); static DmControls *ctl; ctl = [DmControls new];
+          NSMenuItem *ci = [wm addItemWithTitle:@"Controls…" action:@selector(show:) keyEquivalent:@","]; ci.target = ctl; }
         const char *fs = getenv("DM_FULLSCREEN");   // 1 (or any value but 0): start in fullscreen; 0, the settings window's Window, or unset: a window
         if (fs && strcmp(fs, "0")) {
             // A game opened from a fullscreen app starts while macOS leaves that Space. Wait for activation and for the window to reach the active Space before asking for fullscreen
