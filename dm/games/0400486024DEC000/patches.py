@@ -14,9 +14,9 @@ def frame_step(ctx):
     fs_site(site, '2818201e')   # fdiv s8,s1,s0
     start = here(); emit(ADRP(16, here(), FS_STATE_OFF))
     for w in (0xb9400211,   # ldr w17,[x16]          target fps (0 = off)
-              0x340001b1,   # cbz w17,orig (+13)
+              0x34000191,   # cbz w17,orig (+12)
               0xb9402211,   # ldr w17,[x16,#0x20]    step in vsyncs
-              0x34000171,   # cbz w17,orig (+11)     not decided yet
+              0x34000151,   # cbz w17,orig (+10)     not decided yet
               0x1e230220,   # ucvtf s0,w17
               0xf9401a10,   # ldr x16,[x16,#0x30]
               0x8b110210):  # add x16,x16,x17
@@ -24,9 +24,8 @@ def frame_step(ctx):
     emit(ADRP(17, here(), FS_STATE_OFF))
     for w in (0xf9001a30,   # str x16,[x17,#0x30]    vsyncs stepped
               0x1e210808,   # fmul s8,s0,s1          step × base rate
-              0x52a84e10,   # mov w16,#0x42700000    60.0
-              0x1e270200,   # fmov s0,w16
-              0x1e201908):  # fdiv s8,s8,s0          / 60
+              0xbd402e20,   # ldr s0,[x17,#0x2c]     the step's ticks a second: 60.0, or 120.0 at 120 fps (hle_nvn.c fstep_tick writes it before the first step)
+              0x1e201908):  # fdiv s8,s8,s0          / ticks a second
         emit(w)
     emit(B(here(), site + 4))
     emit(0x1e201828); emit(B(here(), site + 4))   # orig: fdiv s8,s1,s0; back
